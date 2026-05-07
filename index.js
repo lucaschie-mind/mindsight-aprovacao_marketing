@@ -1,36 +1,72 @@
 'use strict';
 
-const express    = require('express');
-const cors       = require('cors');
-const { Pool }   = require('pg');
-const { google } = require('googleapis');
+const express      = require('express');
+const cors         = require('cors');
+const { Pool }     = require('pg');
+const { google }   = require('googleapis');
 const { Readable } = require('stream');
 const {
-  Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
-  HeadingLevel, AlignmentType, BorderStyle, WidthType, ShadingType,
-  LevelFormat
+  Document, Packer, Paragraph, TextRun,
+  Table, TableRow, TableCell,
+  BorderStyle, WidthType, ShadingType
 } = require('docx');
 
+// ─────────────────────────────────────────────────────────────────────
+// CONFIGURAÇÃO
+// ─────────────────────────────────────────────────────────────────────
 const app  = express();
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const PORT = process.env.PORT || 3001;
+
+// Pool com reconexão automática
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('railway')
+    ? { rejectUnauthorized: false }
+    : false,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000
+});
+
+pool.on('error', (err) => {
+  console.error('Erro inesperado no pool do banco:', err.message);
+});
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ─────────────────────────────────────────────────────────────────────
-// HEALTH CHECK
+// HEALTH CHECK — Railway bate aqui para confirmar que o serviço subiu
 // ─────────────────────────────────────────────────────────────────────
-app.get('/health', async (_, res) => {
+app.get('/health', async (req, res) => {
+  const status = {
+    ok:        true,
+    ts:        new Date().toISOString(),
+    db:        'nao testado',
+    drive:     process.env.DRIVE_FOLDER_ID && process.env.DRIVE_FOLDER_ID !== 'placeholder'
+                 ? 'configurado' : 'pendente',
+    gauth:     process.env.GOOGLE_SERVICE_ACCOUNT && process.env.GOOGLE_SERVICE_ACCOUNT !== '{}'
+                 ? 'configurado' : 'pendente'
+  };
+
   try {
     await pool.query('SELECT 1');
-    res.json({ ok: true, db: 'conectado', ts: new Date().toISOString() });
+    status.db = 'conectado';
   } catch (e) {
-    res.status(500).json({ ok: false, erro: e.message });
+    status.db  = 'erro: ' + e.message;
+    status.ok  = false;
   }
+
+  res.status(status.ok ? 200 : 500).json(status);
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// ROTA PRINCIPAL — POST /aprovar
+// POST /aprovar
+// Body esperado:
+//   modulo, etapa_funil, canal, tipo_conteudo (obrigatórios)
+//   titulo, corpo_conteudo                   (obrigatórios)
+//   geo_ou_humano, persona_alvo, objetivo    (opcionais)
+//   usuario, contexto_brief, formato_saida  (opcionais)
 // ─────────────────────────────────────────────────────────────────────
 app.post('/aprovar', async (req, res) => {
   const {
@@ -48,20 +84,21 @@ app.post('/aprovar', async (req, res) => {
     formato_saida  = 'markdown'
   } = req.body;
 
-  // Validação mínima
+  // Validação dos campos obrigatórios
   const obrigatorios = { modulo, etapa_funil, canal, tipo_conteudo, titulo, corpo_conteudo };
   const faltando = Object.entries(obrigatorios)
-    .filter(([, v]) => !v || !v.trim())
+    .filter(([, v]) => !v || !String(v).trim())
     .map(([k]) => k);
 
   if (faltando.length) {
     return res.status(400).json({
-      ok: false,
-      erro: `Campos obrigatórios ausentes: ${faltando.join(', ')}`
+      ok:   false,
+      erro: `Campos obrigatorios ausentes: ${faltando.join(', ')}`
     });
   }
 
   const client = await pool.connect();
+
   try {
     await client.query('BEGIN');
 
@@ -86,7 +123,7 @@ app.post('/aprovar', async (req, res) => {
        corpo_conteudo, formato_saida, geo_ou_humano]
     );
 
-    // 3. Inserir aprovação (url será atualizada após upload)
+    // 3. Inserir aprovação
     await client.query(`
       INSERT INTO aprovacoes
         (conteudo_id, aprovado_por, aprovado_em, adicionado_repo)
@@ -102,28 +139,33 @@ app.post('/aprovar', async (req, res) => {
     );
 
     // 5. Gerar .docx
-    const docBuffer = await gerarDocx({
-      titulo, modulo, etapa_funil, canal, tipo_conteudo,
-      geo_ou_humano, persona_alvo, objetivo,
-      corpo_conteudo, usuario, contexto_brief,
-      campanha_id: campanha.id,
-      conteudo_id: conteudo.id
-    });
-
-    // 6. Upload para o Google Drive
-    let driveUrl = null;
+    let docBuffer;
     try {
-      driveUrl = await uploadDrive(docBuffer, nomeArquivo);
+      docBuffer = await gerarDocx({
+        titulo, modulo, etapa_funil, canal, tipo_conteudo,
+        geo_ou_humano, persona_alvo, objetivo, corpo_conteudo,
+        usuario, contexto_brief,
+        campanha_id: campanha.id,
+        conteudo_id: conteudo.id
+      });
+    } catch (docErr) {
+      console.error('Erro ao gerar docx (nao bloqueia):', docErr.message);
+    }
 
-      // Atualizar URL e flag no banco
-      await pool.query(`
-        UPDATE aprovacoes
-        SET url_publicado = $1, adicionado_repo = true
-        WHERE conteudo_id = $2`,
-        [driveUrl, conteudo.id]
-      );
-    } catch (driveErr) {
-      console.error('Erro no upload Drive (não bloqueia):', driveErr.message);
+    // 6. Upload para o Google Drive (não bloqueia se falhar)
+    let driveUrl = null;
+    if (docBuffer) {
+      try {
+        driveUrl = await uploadDrive(docBuffer, nomeArquivo);
+        await pool.query(`
+          UPDATE aprovacoes
+          SET url_publicado = $1, adicionado_repo = true
+          WHERE conteudo_id = $2`,
+          [driveUrl, conteudo.id]
+        );
+      } catch (driveErr) {
+        console.error('Upload Drive nao realizado:', driveErr.message);
+      }
     }
 
     return res.json({
@@ -133,13 +175,13 @@ app.post('/aprovar', async (req, res) => {
       arquivo:     `${nomeArquivo}.docx`,
       drive_url:   driveUrl,
       mensagem:    driveUrl
-        ? `Conteúdo aprovado e salvo no Drive: ${nomeArquivo}.docx`
-        : `Conteúdo aprovado e salvo no banco. Upload no Drive falhou — verifique as credenciais.`
+        ? `Conteudo aprovado e salvo no Drive: ${nomeArquivo}.docx`
+        : `Conteudo aprovado e salvo no banco. Drive pendente de configuracao.`
     });
 
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('Erro em /aprovar:', err);
+    console.error('Erro em /aprovar:', err.message);
     return res.status(500).json({ ok: false, erro: err.message });
   } finally {
     client.release();
@@ -147,38 +189,80 @@ app.post('/aprovar', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// ROTA — GET /campanhas  (consulta para o dashboard)
+// GET /stats — resumo para o dashboard
+// Query params: dias (default 90), modulo, funil, canal
 // ─────────────────────────────────────────────────────────────────────
-app.get('/campanhas', async (req, res) => {
-  const { modulo, funil, canal, dias = 90 } = req.query;
-
-  let where = [`c.criado_em >= NOW() - INTERVAL '${parseInt(dias, 10)} days'`];
-  const params = [];
-
-  if (modulo && modulo !== 'todos') {
-    params.push(modulo);
-    where.push(`c.modulo = $${params.length}`);
-  }
-  if (funil && funil !== 'todos') {
-    params.push(funil);
-    where.push(`c.etapa_funil = $${params.length}`);
-  }
-  if (canal && canal !== 'todos') {
-    params.push(canal);
-    where.push(`co.canal = $${params.length}`);
-  }
-
-  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+app.get('/stats', async (req, res) => {
+  const dias = Math.min(Math.max(parseInt(req.query.dias || 90, 10), 1), 365);
 
   try {
     const { rows } = await pool.query(`
       SELECT
-        c.id           AS campanha_id,
+        c.modulo,
+        c.etapa_funil,
+        co.canal,
+        co.tipo_conteudo,
+        co.geo_ou_humano,
+        COUNT(DISTINCT c.id)                          AS total_campanhas,
+        COUNT(DISTINCT co.id)                         AS total_conteudos,
+        COUNT(DISTINCT a.id)                          AS total_aprovados,
+        COUNT(DISTINCT CASE
+          WHEN a.adicionado_repo = true THEN a.id
+        END)                                          AS no_drive
+      FROM campanhas c
+      LEFT JOIN conteudos  co ON co.campanha_id = c.id
+      LEFT JOIN aprovacoes a  ON a.conteudo_id  = co.id
+      WHERE c.criado_em >= NOW() - ($1 || ' days')::INTERVAL
+      GROUP BY
+        c.modulo, c.etapa_funil,
+        co.canal, co.tipo_conteudo, co.geo_ou_humano
+      ORDER BY total_conteudos DESC`,
+      [dias]
+    );
+    res.json({ ok: true, dias, total_linhas: rows.length, dados: rows });
+  } catch (err) {
+    console.error('Erro em /stats:', err.message);
+    res.status(500).json({ ok: false, erro: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// GET /campanhas — lista paginada para o dashboard
+// Query params: dias, modulo, funil, canal, pagina (default 1)
+// ─────────────────────────────────────────────────────────────────────
+app.get('/campanhas', async (req, res) => {
+  const dias   = Math.min(Math.max(parseInt(req.query.dias   || 90,  10), 1), 365);
+  const pagina = Math.max(parseInt(req.query.pagina || 1, 10), 1);
+  const limite = 50;
+  const offset = (pagina - 1) * limite;
+
+  const condicoes = [`c.criado_em >= NOW() - ($1 || ' days')::INTERVAL`];
+  const params    = [String(dias)];
+
+  if (req.query.modulo && req.query.modulo !== 'todos') {
+    params.push(req.query.modulo);
+    condicoes.push(`c.modulo = $${params.length}`);
+  }
+  if (req.query.funil && req.query.funil !== 'todos') {
+    params.push(req.query.funil);
+    condicoes.push(`c.etapa_funil = $${params.length}`);
+  }
+  if (req.query.canal && req.query.canal !== 'todos') {
+    params.push(req.query.canal);
+    condicoes.push(`co.canal = $${params.length}`);
+  }
+
+  const where = condicoes.join(' AND ');
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        c.id            AS campanha_id,
         c.modulo,
         c.etapa_funil,
         c.status,
         c.criado_em,
-        co.id          AS conteudo_id,
+        co.id           AS conteudo_id,
         co.tipo_conteudo,
         co.canal,
         co.titulo,
@@ -188,119 +272,98 @@ app.get('/campanhas', async (req, res) => {
         a.url_publicado,
         a.adicionado_repo
       FROM campanhas c
-      LEFT JOIN conteudos co ON co.campanha_id = c.id
-      LEFT JOIN aprovacoes a ON a.conteudo_id  = co.id
-      ${whereClause}
+      LEFT JOIN conteudos  co ON co.campanha_id = c.id
+      LEFT JOIN aprovacoes a  ON a.conteudo_id  = co.id
+      WHERE ${where}
       ORDER BY c.criado_em DESC
-      LIMIT 500`,
-      params
+      LIMIT $${params.length + 1}
+      OFFSET $${params.length + 2}`,
+      [...params, limite, offset]
     );
-    res.json({ ok: true, total: rows.length, dados: rows });
+    res.json({ ok: true, pagina, limite, total: rows.length, dados: rows });
   } catch (err) {
-    res.status(500).json({ ok: false, erro: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────
-// ROTA — GET /stats  (resumo para o dashboard)
-// ─────────────────────────────────────────────────────────────────────
-app.get('/stats', async (req, res) => {
-  const dias = parseInt(req.query.dias || 90, 10);
-  try {
-    const { rows } = await pool.query(`
-      SELECT
-        c.modulo,
-        c.etapa_funil,
-        co.canal,
-        co.tipo_conteudo,
-        co.geo_ou_humano,
-        COUNT(c.id)                                     AS total_gerados,
-        COUNT(a.id)                                     AS total_aprovados,
-        COUNT(a.publicado_em)                           AS total_publicados,
-        COUNT(CASE WHEN a.adicionado_repo THEN 1 END)   AS no_drive
-      FROM campanhas c
-      LEFT JOIN conteudos co ON co.campanha_id = c.id
-      LEFT JOIN aprovacoes a ON a.conteudo_id  = co.id
-      WHERE c.criado_em >= NOW() - INTERVAL '${dias} days'
-      GROUP BY c.modulo, c.etapa_funil, co.canal, co.tipo_conteudo, co.geo_ou_humano
-      ORDER BY total_gerados DESC`,
-      []
-    );
-    res.json({ ok: true, dados: rows });
-  } catch (err) {
+    console.error('Erro em /campanhas:', err.message);
     res.status(500).json({ ok: false, erro: err.message });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────
 // HELPER — NOME DO ARQUIVO
+// Padrão: AAAA-MM-DD_Modulo_Funil_canal_tipo_slug-titulo
 // ─────────────────────────────────────────────────────────────────────
 function gerarNomeArquivo(modulo, funil, canal, tipo, titulo) {
   const data = new Date().toISOString().slice(0, 10);
 
-  const slug = (titulo || 'sem-titulo')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s-]/g, '')
-    .trim()
-    .replace(/\s+/g, '-')
-    .slice(0, 50);
+  const slugify = (str) =>
+    (str || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9\s-]/g, '')
+      .trim()
+      .replace(/\s+/g, '-');
 
-  const canalSlug  = (canal  || '').replace(/_/g, '-');
-  const moduloSlug = (modulo || '').replace(/\s+/g, '-');
-  const funilSlug  = (funil  || '').replace(/\s+/g, '-');
+  const slug = slugify(titulo).slice(0, 50);
 
-  return `${data}_${moduloSlug}_${funilSlug}_${canalSlug}_${tipo}_${slug}`;
+  return [
+    data,
+    slugify(modulo),
+    slugify(funil),
+    slugify(canal),
+    slugify(tipo),
+    slug || 'sem-titulo'
+  ].join('_');
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // HELPER — GERAR DOCX
 // ─────────────────────────────────────────────────────────────────────
 async function gerarDocx(dados) {
-  const COR_ROXO   = '5B4FBE';
-  const COR_TEXTO  = '1A1A2E';
-  const COR_CINZA  = 'F7F7F7';
-  const COR_BRANCO = 'FFFFFF';
-  const COR_BORDA  = 'CCCCCC';
+  const ROXO   = '5B4FBE';
+  const TEXTO  = '1A1A2E';
+  const CINZA  = 'F7F7F7';
+  const BRANCO = 'FFFFFF';
+  const BORDA  = 'CCCCCC';
 
-  const borda1 = { style: BorderStyle.SINGLE, size: 1, color: COR_BORDA };
-  const bordas = { top: borda1, bottom: borda1, left: borda1, right: borda1 };
+  const b = { style: BorderStyle.SINGLE, size: 1, color: BORDA };
+  const bordas = { top: b, bottom: b, left: b, right: b };
 
   const metaRow = (label, valor) => new TableRow({
     children: [
       new TableCell({
         borders: bordas,
         width: { size: 2600, type: WidthType.DXA },
-        shading: { fill: COR_CINZA, type: ShadingType.CLEAR },
+        shading: { fill: CINZA, type: ShadingType.CLEAR },
         margins: { top: 80, bottom: 80, left: 120, right: 120 },
         children: [new Paragraph({
           children: [new TextRun({
-            text: label, font: 'Arial', size: 20, bold: true, color: COR_ROXO
+            text: label,
+            font: 'Arial', size: 20, bold: true, color: ROXO
           })]
         })]
       }),
       new TableCell({
         borders: bordas,
         width: { size: 6426, type: WidthType.DXA },
-        shading: { fill: COR_BRANCO, type: ShadingType.CLEAR },
+        shading: { fill: BRANCO, type: ShadingType.CLEAR },
         margins: { top: 80, bottom: 80, left: 120, right: 120 },
         children: [new Paragraph({
           children: [new TextRun({
-            text: String(valor || '—'), font: 'Arial', size: 20, color: COR_TEXTO
+            text: String(valor || '—'),
+            font: 'Arial', size: 20, color: TEXTO
           })]
         })]
       })
     ]
   });
 
-  // Converte o corpo em parágrafos, mantendo quebras de linha
   const linhasCorpo = (dados.corpo_conteudo || '')
     .split('\n')
     .map(linha => new Paragraph({
       spacing: { before: 60, after: 60 },
       children: [new TextRun({
-        text: linha, font: 'Arial', size: 22, color: COR_TEXTO
+        text: linha,
+        font: 'Arial', size: 22, color: TEXTO
       })]
     }));
 
@@ -313,57 +376,57 @@ async function gerarDocx(dados) {
         }
       },
       children: [
-        // ── Título ──
+        // Título
         new Paragraph({
           spacing: { before: 0, after: 200 },
           children: [new TextRun({
-            text: dados.titulo || 'Sem título',
-            font: 'Arial', size: 36, bold: true, color: COR_ROXO
+            text: dados.titulo || 'Sem titulo',
+            font: 'Arial', size: 36, bold: true, color: ROXO
           })]
         }),
 
-        // ── Tabela de metadados ──
+        // Tabela de metadados
         new Table({
           width: { size: 9026, type: WidthType.DXA },
           columnWidths: [2600, 6426],
           rows: [
-            metaRow('Módulo',          dados.modulo),
-            metaRow('Etapa do funil',  dados.etapa_funil),
-            metaRow('Canal',           dados.canal),
-            metaRow('Tipo',            dados.tipo_conteudo),
-            metaRow('GEO ou humano',   dados.geo_ou_humano),
-            metaRow('Persona-alvo',    dados.persona_alvo),
-            metaRow('Objetivo',        dados.objetivo),
-            metaRow('Contexto/brief',  dados.contexto_brief),
-            metaRow('Gerado por',      dados.usuario),
-            metaRow('ID campanha',     String(dados.campanha_id)),
-            metaRow('ID conteúdo',     String(dados.conteudo_id)),
-            metaRow('Aprovado em',     new Date().toLocaleString('pt-BR')),
+            metaRow('Modulo',         dados.modulo),
+            metaRow('Etapa do funil', dados.etapa_funil),
+            metaRow('Canal',          dados.canal),
+            metaRow('Tipo',           dados.tipo_conteudo),
+            metaRow('GEO ou humano',  dados.geo_ou_humano),
+            metaRow('Persona-alvo',   dados.persona_alvo),
+            metaRow('Objetivo',       dados.objetivo),
+            metaRow('Brief/contexto', dados.contexto_brief),
+            metaRow('Gerado por',     dados.usuario),
+            metaRow('ID campanha',    String(dados.campanha_id)),
+            metaRow('ID conteudo',    String(dados.conteudo_id)),
+            metaRow('Aprovado em',    new Date().toLocaleString('pt-BR'))
           ]
         }),
 
-        // ── Espaço ──
-        new Paragraph({ spacing: { before: 300, after: 0 }, children: [] }),
+        // Espaço
+        new Paragraph({ spacing: { before: 280, after: 0 }, children: [] }),
 
-        // ── Divisor ──
+        // Divisor
         new Paragraph({
           spacing: { before: 0, after: 240 },
           border: {
-            bottom: { style: BorderStyle.SINGLE, size: 6, color: COR_ROXO, space: 1 }
+            bottom: { style: BorderStyle.SINGLE, size: 6, color: ROXO, space: 1 }
           },
           children: []
         }),
 
-        // ── Subtítulo do conteúdo ──
+        // Subtítulo
         new Paragraph({
           spacing: { before: 0, after: 160 },
           children: [new TextRun({
-            text: 'Conteúdo aprovado',
-            font: 'Arial', size: 28, bold: true, color: COR_TEXTO
+            text: 'Conteudo aprovado',
+            font: 'Arial', size: 28, bold: true, color: TEXTO
           })]
         }),
 
-        // ── Corpo ──
+        // Corpo
         ...linhasCorpo
       ]
     }]
@@ -374,19 +437,30 @@ async function gerarDocx(dados) {
 
 // ─────────────────────────────────────────────────────────────────────
 // HELPER — UPLOAD GOOGLE DRIVE
+// Só executa se as variáveis estiverem configuradas de verdade
 // ─────────────────────────────────────────────────────────────────────
 async function uploadDrive(buffer, nomeArquivo) {
-  const credenciais = process.env.GOOGLE_SERVICE_ACCOUNT;
-  const folderId    = process.env.DRIVE_FOLDER_ID;
+  const credRaw    = process.env.GOOGLE_SERVICE_ACCOUNT || '';
+  const folderId   = process.env.DRIVE_FOLDER_ID        || '';
 
-  if (!credenciais || !folderId) {
-    throw new Error(
-      'Variáveis GOOGLE_SERVICE_ACCOUNT ou DRIVE_FOLDER_ID não configuradas.'
-    );
+  // Não tenta subir se ainda está como placeholder
+  if (!credRaw || credRaw === '{}' || !folderId || folderId === 'placeholder') {
+    throw new Error('Drive pendente de configuracao — verifique GOOGLE_SERVICE_ACCOUNT e DRIVE_FOLDER_ID');
+  }
+
+  let credenciais;
+  try {
+    credenciais = JSON.parse(credRaw);
+  } catch (e) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT nao e um JSON valido');
+  }
+
+  if (!credenciais.client_email || !credenciais.private_key) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT nao tem client_email ou private_key');
   }
 
   const auth = new google.auth.GoogleAuth({
-    credentials: JSON.parse(credenciais),
+    credentials: credenciais,
     scopes: ['https://www.googleapis.com/auth/drive']
   });
 
@@ -395,16 +469,16 @@ async function uploadDrive(buffer, nomeArquivo) {
   stream.push(buffer);
   stream.push(null);
 
+  const mimeType =
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
   const { data } = await drive.files.create({
     requestBody: {
-      name:     `${nomeArquivo}.docx`,
-      parents:  [folderId],
-      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      name:    `${nomeArquivo}.docx`,
+      parents: [folderId],
+      mimeType
     },
-    media: {
-      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      body: stream
-    },
+    media: { mimeType, body: stream },
     fields: 'id,webViewLink'
   });
 
@@ -414,10 +488,9 @@ async function uploadDrive(buffer, nomeArquivo) {
 // ─────────────────────────────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`✅ Serviço de aprovação rodando na porta ${PORT}`);
-  console.log(`   DB configurado: ${process.env.DATABASE_URL ? 'sim' : 'NÃO'}`);
-  console.log(`   Drive folder:   ${process.env.DRIVE_FOLDER_ID || 'NÃO configurado'}`);
-  console.log(`   Service account:${process.env.GOOGLE_SERVICE_ACCOUNT ? ' sim' : ' NÃO configurado'}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Servico de aprovacao rodando na porta ${PORT}`);
+  console.log(`DB:     ${process.env.DATABASE_URL            ? 'configurado' : 'NAO CONFIGURADO'}`);
+  console.log(`Drive:  ${process.env.DRIVE_FOLDER_ID         ? process.env.DRIVE_FOLDER_ID : 'pendente'}`);
+  console.log(`GAuth:  ${process.env.GOOGLE_SERVICE_ACCOUNT  ? 'configurado' : 'pendente'}`);
 });
