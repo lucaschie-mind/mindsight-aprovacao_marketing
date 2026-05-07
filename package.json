@@ -1,11 +1,10 @@
 {
   "name": "mindsight-aprovacao-marketing",
   "version": "1.0.0",
-  "description": "Serviço de aprovação de conteúdos do Agente de Marketing Mindsight",
+  "description": "Servico de aprovacao de conteudos do Agente de Marketing Mindsight",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
